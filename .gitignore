@@ -1,0 +1,15 @@
+# Python
+**/__pycache__/
+**/*.pyc
+backend/venv/
+backend/climate.db
+
+# Node / React
+**/node_modules/
+frontend/dist/
+frontend/.env
+
+# IDE & OS
+.idea/
+.vscode/
+.DS_Store
