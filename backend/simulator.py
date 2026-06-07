@@ -107,6 +107,9 @@ class CascadedClimateController:
         self.last_inflow_setpoint = (inflow_min + inflow_max) / 2.0
         self.last_airflow_power = f_min
 
+    def reset_integrator(self) -> None:
+        self.integral = 0.0
+
     def calculate(
         self,
         target_temp: float,

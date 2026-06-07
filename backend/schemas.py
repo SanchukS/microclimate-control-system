@@ -5,7 +5,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 PowerLevel = Annotated[float, Field(ge=0.0, le=100.0)]
 TimeHHMM = Annotated[str, Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")]
-SystemState = Literal["STANDBY", "SAFETY_CORRECTION", "PRE_START", "WORK_SHIFT"]
+SystemState = Literal[
+    "STANDBY", "SAFETY_CORRECTION", "PRE_START", "WORK_SHIFT", "PURGING"
+]
 
 
 class TelemetryLogCreate(BaseModel):

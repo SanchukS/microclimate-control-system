@@ -28,7 +28,6 @@ t_purge_max_cool = 600.0
 F_min = 20.0
 Kp = 4.0
 Ki = 0.1
-Kd = 1.0
 K_fan = 5.0
 K_H = 0.5
 K_C = 0.5
@@ -61,7 +60,6 @@ alpha = 0.2
 pre_start_timer = 0.0
 pre_start_temp_start = 15.0
 purge_timer = 0.0
-is_purging = False
 prev_inflow_setpoint = 15.0
 safe_start_timer = 0.0
 is_safe_starting = False
@@ -170,18 +168,16 @@ def _enter_state(new_state: SystemState) -> None:
     if new_state == current_state:
         return
 
-    if new_state in ("SAFETY_CORRECTION", "PRE_START"):
+    if current_state in ("STANDBY", "PURGING") and new_state in (
+        "SAFETY_CORRECTION",
+        "PRE_START",
+        "WORK_SHIFT",
+    ):
         is_safe_starting = True
         safe_start_timer = 0.0
+        controller.reset_integrator()
 
     current_state = new_state
-
-
-def _activate_purge() -> None:
-    global is_purging, purge_timer
-
-    is_purging = True
-    purge_timer = 0.0
 
 
 def _tick_safe_start() -> bool:
@@ -228,7 +224,7 @@ def _apply_controller(target_temp: float, current_time: float) -> None:
 
 
 def _process_purge() -> None:
-    global is_purging, purge_timer, heater_pwr, cooler_pwr, airflow_pwr, dampers_open
+    global purge_timer, heater_pwr, cooler_pwr, airflow_pwr, dampers_open
 
     heater_pwr = 0.0
     cooler_pwr = 0.0
@@ -253,7 +249,6 @@ def _process_purge() -> None:
         )
 
     if purge_complete:
-        is_purging = False
         heater_pwr = 0.0
         cooler_pwr = 0.0
         airflow_pwr = 0.0
@@ -265,6 +260,12 @@ def _run_standby_logic(db: Session, now_min: int) -> None:
     global current_target_temp, pre_start_temp_start, pre_start_timer
     global safety_target_temp, safety_heating
     global heater_pwr, cooler_pwr, airflow_pwr, dampers_open
+
+    active_shift = _get_active_shift(db, now_min)
+    if active_shift is not None:
+        current_target_temp = active_shift.target_temp
+        _enter_state("WORK_SHIFT")
+        return
 
     heater_pwr = 0.0
     cooler_pwr = 0.0
@@ -303,7 +304,7 @@ def _run_standby_logic(db: Session, now_min: int) -> None:
 
 
 def _run_safety_correction_logic(current_time: float) -> None:
-    global current_target_temp
+    global current_target_temp, purge_timer
 
     if _tick_safe_start():
         _apply_safe_start_outputs()
@@ -319,8 +320,8 @@ def _run_safety_correction_logic(current_time: float) -> None:
     )
 
     if corrected:
-        _activate_purge()
-        _enter_state("STANDBY")
+        purge_timer = 0.0
+        _enter_state("PURGING")
 
 
 def _run_pre_start_logic(db: Session, now_min: int, current_time: float) -> None:
@@ -349,12 +350,12 @@ def _run_pre_start_logic(db: Session, now_min: int, current_time: float) -> None
 
 
 def _run_work_shift_logic(db: Session, now_min: int, current_time: float) -> None:
-    global current_target_temp
+    global current_target_temp, purge_timer
 
     active_shift = _get_active_shift(db, now_min)
     if active_shift is None:
-        _activate_purge()
-        _enter_state("STANDBY")
+        purge_timer = 0.0
+        _enter_state("PURGING")
         return
 
     current_target_temp = active_shift.target_temp
@@ -369,10 +370,6 @@ def _run_automatic_control(db: Session) -> None:
     now_min = _now_minutes()
     current_time = time.time()
 
-    if is_purging:
-        _process_purge()
-        return
-
     if current_state == "STANDBY":
         _run_standby_logic(db, now_min)
     elif current_state == "SAFETY_CORRECTION":
@@ -381,6 +378,8 @@ def _run_automatic_control(db: Session) -> None:
         _run_pre_start_logic(db, now_min, current_time)
     elif current_state == "WORK_SHIFT":
         _run_work_shift_logic(db, now_min, current_time)
+    elif current_state == "PURGING":
+        _process_purge()
 
 
 async def simulation_loop() -> None:
@@ -503,9 +502,12 @@ def set_manual_mode(body: ManualControlRequest) -> SystemStatus:
 
 @app.post("/api/auto", response_model=SystemStatus)
 def set_auto_mode() -> SystemStatus:
-    global is_manual_mode
+    global is_manual_mode, purge_timer
 
     is_manual_mode = False
+    if simulator.heater_temp >= T_heater_safe or simulator.cooler_temp <= T_cooler_safe:
+        purge_timer = 0.0
+        _enter_state("PURGING")
     return _current_status()
 
 
