@@ -31,11 +31,17 @@ class TelemetryLog(Base):
     )
     inside_temp: Mapped[float] = mapped_column(Float)
     outside_temp: Mapped[float] = mapped_column(Float)
+    inflow_temp: Mapped[float] = mapped_column(Float)
+    heater_temp: Mapped[float] = mapped_column(Float)
+    cooler_temp: Mapped[float] = mapped_column(Float)
     target_temp: Mapped[float] = mapped_column(Float)
     heater_power: Mapped[float] = mapped_column(Float)
     cooler_power: Mapped[float] = mapped_column(Float)
     airflow_power: Mapped[float] = mapped_column(Float)
+    dampers_open: Mapped[bool] = mapped_column(Boolean)
     is_manual_mode: Mapped[bool] = mapped_column(Boolean)
+    current_state: Mapped[str] = mapped_column(String(20))
+    t_pre_start: Mapped[float] = mapped_column(Float)
 
 
 class WorkShift(Base):
