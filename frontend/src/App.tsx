@@ -12,6 +12,7 @@ import {
 } from 'recharts'
 import {
   Shield,
+  ShieldAlert,
   Factory,
   Thermometer,
   Sun,
@@ -23,18 +24,30 @@ import {
   Plus,
   Power,
   Settings2,
+  AirVent,
+  Timer,
+  PanelTopOpen,
+  PanelTopClose,
 } from 'lucide-react'
 
 const API_BASE = 'http://localhost:8000'
 
+type SystemState = 'STANDBY' | 'SAFETY_CORRECTION' | 'PRE_START' | 'WORK_SHIFT'
+
 interface SystemStatus {
   inside_temp: number
   outside_temp: number
+  inflow_temp: number
+  heater_temp: number
+  cooler_temp: number
   target_temp: number
   heater_power: number
   cooler_power: number
   airflow_power: number
+  dampers_open: boolean
   is_manual_mode: boolean
+  current_state: SystemState
+  t_pre_start: number
 }
 
 interface TelemetryLog {
@@ -42,11 +55,17 @@ interface TelemetryLog {
   timestamp: string
   inside_temp: number
   outside_temp: number
+  inflow_temp: number
+  heater_temp: number
+  cooler_temp: number
   target_temp: number
   heater_power: number
   cooler_power: number
   airflow_power: number
+  dampers_open: boolean
   is_manual_mode: boolean
+  current_state: SystemState
+  t_pre_start: number
 }
 
 interface WorkShift {
@@ -62,7 +81,43 @@ interface ShiftForm {
   target_temp: string
 }
 
-const ECO_TARGET = 10.0
+const STATE_CONFIG: Record<
+  SystemState,
+  { label: string; description: string; icon: ComponentType<{ className?: string }>; ring: string; bg: string; text: string }
+> = {
+  STANDBY: {
+    label: 'Энергосбережение / STANDBY',
+    description: 'Ожидание, оборудование отключено',
+    icon: Shield,
+    ring: 'ring-emerald-500/30',
+    bg: 'bg-emerald-500/15',
+    text: 'text-emerald-300',
+  },
+  SAFETY_CORRECTION: {
+    label: 'Аварийная коррекция ТБ',
+    description: 'Коррекция по пределам безопасности',
+    icon: ShieldAlert,
+    ring: 'ring-red-500/30',
+    bg: 'bg-red-500/15',
+    text: 'text-red-300',
+  },
+  PRE_START: {
+    label: 'Адаптивный предпуск',
+    description: 'Подготовка к началу смены',
+    icon: Timer,
+    ring: 'ring-amber-500/30',
+    bg: 'bg-amber-500/15',
+    text: 'text-amber-300',
+  },
+  WORK_SHIFT: {
+    label: 'Рабочая смена',
+    description: 'Активный режим производства',
+    icon: Factory,
+    ring: 'ring-orange-500/30',
+    bg: 'bg-orange-500/15',
+    text: 'text-orange-300',
+  },
+}
 
 function formatTimestamp(ts: string): string {
   const d = new Date(ts)
@@ -96,12 +151,14 @@ function PowerBar({
   iconClass,
   barClass,
   icon: Icon,
+  equipmentTemp,
 }: {
   label: string
   value: number
   iconClass: string
   barClass: string
   icon: ComponentType<{ className?: string }>
+  equipmentTemp?: number
 }) {
   const clamped = Math.min(100, Math.max(0, value))
   return (
@@ -119,6 +176,12 @@ function PowerBar({
           style={{ width: `${clamped}%` }}
         />
       </div>
+      {equipmentTemp !== undefined && (
+        <p className="text-xs text-slate-500">
+          T оборудования:{' '}
+          <span className="font-mono text-slate-300">{equipmentTemp.toFixed(1)}°C</span>
+        </p>
+      )}
     </div>
   )
 }
@@ -151,6 +214,72 @@ function MetricCard({
         {unit && <span className="text-lg text-slate-500">{unit}</span>}
       </div>
       {children}
+    </div>
+  )
+}
+
+function StateCard({ state }: { state: SystemState | undefined }) {
+  const config = state ? STATE_CONFIG[state] : null
+  const Icon = config?.icon ?? Shield
+
+  return (
+    <div className="rounded-xl border border-slate-700/60 bg-slate-900/80 p-5 shadow-lg backdrop-blur-sm">
+      <div className="mb-3 text-xs font-medium uppercase tracking-wider text-slate-500">
+        Режим работы САУ
+      </div>
+      {config ? (
+        <div className="flex items-center gap-3">
+          <div
+            className={`flex h-12 w-12 items-center justify-center rounded-lg ring-1 ${config.bg} ${config.ring}`}
+          >
+            <Icon className={`h-6 w-6 ${config.text}`} />
+          </div>
+          <div>
+            <p className={`font-semibold ${config.text}`}>{config.label}</p>
+            <p className="text-xs text-slate-500">{config.description}</p>
+          </div>
+        </div>
+      ) : (
+        <p className="font-mono text-3xl font-semibold text-slate-50">—</p>
+      )}
+    </div>
+  )
+}
+
+function DampersCard({ open }: { open: boolean | undefined }) {
+  const isOpen = open === true
+  const Icon = isOpen ? PanelTopOpen : PanelTopClose
+
+  return (
+    <div className="rounded-xl border border-slate-700/60 bg-slate-900/80 p-5 shadow-lg backdrop-blur-sm">
+      <div className="mb-3 text-xs font-medium uppercase tracking-wider text-slate-500">
+        Заслонки вентиляции
+      </div>
+      <div className="flex items-center gap-3">
+        <div
+          className={`flex h-12 w-12 items-center justify-center rounded-lg ring-1 ${
+            isOpen
+              ? 'bg-emerald-500/15 ring-emerald-500/30'
+              : 'bg-slate-700/30 ring-slate-600/40'
+          }`}
+        >
+          <Icon
+            className={`h-6 w-6 ${isOpen ? 'text-emerald-400' : 'text-slate-500'}`}
+          />
+        </div>
+        <div>
+          <p
+            className={`text-lg font-bold tracking-wide ${
+              isOpen ? 'text-emerald-400' : 'text-slate-500'
+            }`}
+          >
+            {open === undefined ? '—' : isOpen ? 'ОТКРЫТЫ' : 'ЗАКРЫТЫ'}
+          </p>
+          <p className="text-xs text-slate-500">
+            {isOpen ? 'Приток наружного воздуха' : 'Рециркуляция / изоляция'}
+          </p>
+        </div>
+      </div>
     </div>
   )
 }
@@ -230,20 +359,10 @@ export default function App() {
           inside_temp: log.inside_temp,
           outside_temp: log.outside_temp,
           target_temp: log.target_temp,
+          inflow_temp: log.inflow_temp,
         })),
     [history],
   )
-
-  const activeShift = useMemo(
-    () => shifts.some((s) => isShiftActive(s.start_time, s.end_time)),
-    [shifts],
-  )
-
-  const systemMode = useMemo(() => {
-    if (activeShift) return 'shift' as const
-    if (status?.target_temp === ECO_TARGET) return 'eco' as const
-    return 'preheat' as const
-  }, [activeShift, status?.target_temp])
 
   const indoorAccent = useMemo(() => {
     if (!status) return ''
@@ -332,7 +451,7 @@ export default function App() {
               Микроклимат — Панель оператора
             </h1>
             <p className="mt-1 text-sm text-slate-500">
-              Система управления климатом производственного помещения
+              Промышленная САУ с каскадным регулированием и конечным автоматом
             </p>
           </div>
           <div className="flex items-center gap-2 rounded-lg border border-slate-700/60 bg-slate-900/60 px-4 py-2">
@@ -386,44 +505,39 @@ export default function App() {
                 icon={Target}
               />
 
-              <div className="rounded-xl border border-slate-700/60 bg-slate-900/80 p-5 shadow-lg backdrop-blur-sm">
-                <div className="mb-3 text-xs font-medium uppercase tracking-wider text-slate-500">
-                  Статус системы
-                </div>
-                {systemMode === 'shift' && (
-                  <div className="flex items-center gap-3">
-                    <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-orange-500/15 ring-1 ring-orange-500/30">
-                      <Factory className="h-6 w-6 text-orange-400" />
-                    </div>
-                    <div>
-                      <p className="font-semibold text-orange-300">Рабочая смена</p>
-                      <p className="text-xs text-slate-500">Активный режим производства</p>
-                    </div>
-                  </div>
-                )}
-                {systemMode === 'eco' && (
-                  <div className="flex items-center gap-3">
-                    <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-emerald-500/15 ring-1 ring-emerald-500/30">
-                      <Shield className="h-6 w-6 text-emerald-400" />
-                    </div>
-                    <div>
-                      <p className="font-semibold text-emerald-300">Энергосбережение</p>
-                      <p className="text-xs text-slate-500">Уставка {ECO_TARGET}°C</p>
-                    </div>
-                  </div>
-                )}
-                {systemMode === 'preheat' && (
-                  <div className="flex items-center gap-3">
-                    <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-amber-500/15 ring-1 ring-amber-500/30">
-                      <Factory className="h-6 w-6 text-amber-400" />
-                    </div>
-                    <div>
-                      <p className="font-semibold text-amber-300">Преднагрев</p>
-                      <p className="text-xs text-slate-500">Подготовка к смене</p>
-                    </div>
-                  </div>
-                )}
-              </div>
+              <MetricCard
+                label="Температура притока"
+                value={status ? status.inflow_temp.toFixed(1) : '—'}
+                unit="°C"
+                icon={AirVent}
+                accent="ring-1 ring-amber-500/30"
+              />
+
+              <StateCard state={status?.current_state} />
+
+              <DampersCard open={status?.dampers_open} />
+
+              <MetricCard
+                label="Время предпуска"
+                value={status ? Math.round(status.t_pre_start).toString() : '—'}
+                unit="мин"
+                icon={Timer}
+              />
+
+              <MetricCard
+                label="Ручной режим"
+                value={status ? (status.is_manual_mode ? 'ВКЛ' : 'ВЫКЛ') : '—'}
+                icon={Settings2}
+                accent={
+                  status?.is_manual_mode
+                    ? 'ring-1 ring-orange-500/40'
+                    : 'ring-1 ring-emerald-500/30'
+                }
+              >
+                <p className="mt-2 text-xs text-slate-500">
+                  {status?.is_manual_mode ? 'Оператор управляет мощностями' : 'Автомат САУ активен'}
+                </p>
+              </MetricCard>
             </section>
 
             <section className="rounded-xl border border-slate-700/60 bg-slate-900/80 p-6 shadow-lg backdrop-blur-sm">
@@ -488,6 +602,16 @@ export default function App() {
                         dot={false}
                         activeDot={{ r: 4 }}
                       />
+                      <Line
+                        type="monotone"
+                        dataKey="inflow_temp"
+                        name="Температура притока"
+                        stroke="#fbbf24"
+                        strokeWidth={2}
+                        strokeDasharray="5 5"
+                        dot={false}
+                        activeDot={{ r: 4 }}
+                      />
                     </LineChart>
                   </ResponsiveContainer>
                 ) : (
@@ -509,6 +633,7 @@ export default function App() {
                   iconClass="text-red-500"
                   barClass="bg-red-500"
                   icon={Flame}
+                  equipmentTemp={status?.heater_temp}
                 />
                 <PowerBar
                   label="Охладитель"
@@ -516,6 +641,7 @@ export default function App() {
                   iconClass="text-blue-500"
                   barClass="bg-blue-500"
                   icon={Snowflake}
+                  equipmentTemp={status?.cooler_temp}
                 />
                 <PowerBar
                   label="Вентиляция"
@@ -539,7 +665,7 @@ export default function App() {
 
               <label className="flex cursor-pointer items-center justify-between rounded-lg border border-slate-700/50 bg-slate-800/50 px-4 py-3">
                 <span className="text-sm text-slate-300">
-                  {isManual ? 'Ручное управление' : 'Автоматический режим (ПИД)'}
+                  {isManual ? 'Ручное управление' : 'Автоматический режим (САУ)'}
                 </span>
                 <button
                   type="button"
