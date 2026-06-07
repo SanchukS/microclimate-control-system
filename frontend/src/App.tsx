@@ -32,7 +32,12 @@ import {
 
 const API_BASE = 'http://localhost:8000'
 
-type SystemState = 'STANDBY' | 'SAFETY_CORRECTION' | 'PRE_START' | 'WORK_SHIFT'
+type SystemState =
+  | 'STANDBY'
+  | 'SAFETY_CORRECTION'
+  | 'PRE_START'
+  | 'WORK_SHIFT'
+  | 'PURGING'
 
 interface SystemStatus {
   inside_temp: number
@@ -116,6 +121,14 @@ const STATE_CONFIG: Record<
     ring: 'ring-orange-500/30',
     bg: 'bg-orange-500/15',
     text: 'text-orange-300',
+  },
+  PURGING: {
+    label: 'Продувка оборудования',
+    description: 'Охлаждение ТЭН / отогрев испарителя',
+    icon: Wind,
+    ring: 'ring-cyan-500/30',
+    bg: 'bg-cyan-500/15',
+    text: 'text-cyan-300',
   },
 }
 
