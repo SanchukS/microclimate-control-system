@@ -1,3 +1,4 @@
+import math
 import random
 
 
@@ -10,11 +11,55 @@ def _sign(value: float) -> float:
 
 
 class ClimateSimulator:
+    C_AIR = 1005.0
+    G_MAX = 1.5
+    C_ROOM_EFF = 5.0e7
+    C_HEATER = 25000.0
+    C_COOLER = 30000.0
+    P_H_MAX = 40000.0
+    P_C_MAX = 30000.0
+    K_WALLS = 750.0
+    K_PASSIVE_H = 15.0
+    K_PASSIVE_C = 15.0
+    K_ACTIVE_H = 1500.0
+    K_ACTIVE_C = 1200.0
+    K_SENSOR_LOSS = 0.005
+    P_BASELINE = 1000.0
+    P_MACH_I = 3000.0
+    P_ON = 0.02
+    P_OFF = 0.015
+
     def __init__(self, inside_temp: float = 15.0) -> None:
         self.inside_temp = inside_temp
+        self.inflow_temp = 15.0
         self.heater_temp = 15.0
         self.cooler_temp = 15.0
-        self.inflow_temp = 15.0
+        self.machine_states = [False] * 5
+        self.P_internal = self.P_BASELINE
+        self.prev_shift_active = False
+
+    def _update_internal_heat(self, is_shift_active: bool, dt: float) -> None:
+        if is_shift_active and not self.prev_shift_active:
+            self.machine_states = [True, True, False, False, False]
+        elif not is_shift_active:
+            self.machine_states = [False] * 5
+            self.P_internal = self.P_BASELINE
+            self.prev_shift_active = is_shift_active
+            return
+        else:
+            p_on_step = self.P_ON * (dt / 60.0)
+            p_off_step = self.P_OFF * (dt / 60.0)
+            for i in range(5):
+                if not self.machine_states[i]:
+                    if random.random() < p_on_step:
+                        self.machine_states[i] = True
+                elif random.random() < p_off_step:
+                    self.machine_states[i] = False
+
+        self.P_internal = self.P_BASELINE + sum(
+            self.P_MACH_I for active in self.machine_states if active
+        )
+        self.prev_shift_active = is_shift_active
 
     def update_physics(
         self,
@@ -23,53 +68,72 @@ class ClimateSimulator:
         airflow_pwr: float,
         dampers_open: bool,
         outside_temp: float,
+        is_shift_active: bool,
         dt: float = 2.0,
     ) -> tuple[float, float, float, float]:
-        if heater_pwr > 0:
-            self.heater_temp += 0.25 * heater_pwr * dt
-        self.heater_temp -= (
-            (self.heater_temp - self.inside_temp)
-            * (0.002 + 0.004 * airflow_pwr / 100.0)
-            * dt
-        )
-        self.heater_temp = max(self.heater_temp, self.inside_temp)
+        d_val = 1.0 if dampers_open else 0.0
+        f_val = airflow_pwr / 100.0
+        g_flow = d_val * f_val * self.G_MAX
 
-        if cooler_pwr > 0:
-            self.cooler_temp -= 0.2 * cooler_pwr * dt
-        self.cooler_temp += (
-            (self.inside_temp - self.cooler_temp)
-            * (0.002 + 0.004 * airflow_pwr / 100.0)
-            * dt
-        )
-        self.cooler_temp = min(self.cooler_temp, self.inside_temp)
+        self._update_internal_heat(is_shift_active, dt)
 
-        if not dampers_open or airflow_pwr == 0:
-            self.inflow_temp = self.inside_temp
-        elif heater_pwr > 0:
-            self.inflow_temp = outside_temp + (
-                (self.heater_temp - outside_temp) * 0.008 * airflow_pwr * dt
+        p_electric_h = (heater_pwr / 100.0) * self.P_H_MAX
+        p_passive_loss_h = self.K_PASSIVE_H * (self.heater_temp - self.inside_temp)
+
+        if g_flow > 0:
+            ntu_h = self.K_ACTIVE_H / (g_flow * self.C_AIR)
+            epsilon_h = 1.0 - math.exp(-ntu_h)
+            t_after_heater = outside_temp + epsilon_h * (
+                self.heater_temp - outside_temp
             )
-            self.inflow_temp = min(self.inflow_temp, self.heater_temp)
-        elif cooler_pwr > 0:
-            self.inflow_temp = outside_temp - (
-                (outside_temp - self.cooler_temp) * 0.008 * airflow_pwr * dt
-            )
-            self.inflow_temp = max(self.inflow_temp, self.cooler_temp)
+            p_active_loss_h = g_flow * self.C_AIR * (t_after_heater - outside_temp)
         else:
-            self.inflow_temp = outside_temp
+            t_after_heater = outside_temp
+            p_active_loss_h = 0.0
 
-        self.inside_temp += (outside_temp - self.inside_temp) * 0.0005 * dt
-        if dampers_open:
-            self.inside_temp += (
-                (self.inflow_temp - self.inside_temp) * 0.0008 * airflow_pwr * dt
+        d_t_heater = (
+            p_electric_h - p_passive_loss_h - p_active_loss_h
+        ) / self.C_HEATER
+        self.heater_temp += dt * d_t_heater
+
+        p_electric_c = (cooler_pwr / 100.0) * self.P_C_MAX
+        p_passive_loss_c = self.K_PASSIVE_C * (self.inside_temp - self.cooler_temp)
+
+        if g_flow > 0:
+            ntu_c = self.K_ACTIVE_C / (g_flow * self.C_AIR)
+            epsilon_c = 1.0 - math.exp(-ntu_c)
+            self.inflow_temp = t_after_heater - epsilon_c * (
+                t_after_heater - self.cooler_temp
             )
-        self.inside_temp += random.uniform(-0.1, 0.1)
+            p_active_loss_c = g_flow * self.C_AIR * (
+                t_after_heater - self.inflow_temp
+            )
+        else:
+            p_active_loss_c = 0.0
+            self.inflow_temp += (
+                dt * self.K_SENSOR_LOSS * (self.inside_temp - self.inflow_temp)
+            )
+
+        d_t_cooler = (
+            -p_electric_c + p_passive_loss_c + p_active_loss_c
+        ) / self.C_COOLER
+        self.cooler_temp += dt * d_t_cooler
+
+        p_walls = self.K_WALLS * (outside_temp - self.inside_temp)
+        p_vent = g_flow * self.C_AIR * (self.inflow_temp - self.inside_temp)
+        d_t_in = (p_walls + p_vent + self.P_internal) / self.C_ROOM_EFF
+        self.inside_temp += dt * d_t_in
+
+        inside_temp_noisy = self.inside_temp + random.gauss(0, 0.1)
+        inflow_temp_noisy = self.inflow_temp + random.gauss(0, 0.1)
+        heater_temp_noisy = self.heater_temp + random.gauss(0, 0.1)
+        cooler_temp_noisy = self.cooler_temp + random.gauss(0, 0.1)
 
         return (
-            self.inside_temp,
-            self.inflow_temp,
-            self.heater_temp,
-            self.cooler_temp,
+            inside_temp_noisy,
+            inflow_temp_noisy,
+            heater_temp_noisy,
+            cooler_temp_noisy,
         )
 
 

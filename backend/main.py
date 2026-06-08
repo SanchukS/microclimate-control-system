@@ -3,6 +3,7 @@ import math
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,6 +37,8 @@ deadband = 0.5
 fan_trigger = 5.0
 SAFE_START_DURATION_SEC = 10.0
 SIMULATION_INTERVAL_SEC = 2.0
+CONTROL_INTERVAL_SEC = 60.0
+TZ_MINSK = ZoneInfo("Europe/Minsk")
 
 # --- Глобальное состояние ---
 simulator = ClimateSimulator(inside_temp=15.0)
@@ -78,6 +81,14 @@ heater_pwr = 0.0
 cooler_pwr = 0.0
 airflow_pwr = 0.0
 dampers_open = False
+sensor_inside_temp = 15.0
+sensor_inflow_temp = 15.0
+sensor_heater_temp = 15.0
+sensor_cooler_temp = 15.0
+control_timer = CONTROL_INTERVAL_SEC
+force_control_run = True
+last_control_timestamp = time.time()
+pre_start_start_timestamp = 0.0
 
 
 class ManualControlRequest(BaseModel):
@@ -108,7 +119,7 @@ def _time_to_minutes(hhmm: str) -> int:
 
 
 def _now_minutes() -> int:
-    now = datetime.now()
+    now = datetime.now(TZ_MINSK)
     return now.hour * 60 + now.minute
 
 
@@ -163,7 +174,7 @@ def _compute_adaptive_pre_start(next_target: float, inside_temp: float) -> float
 
 
 def _enter_state(new_state: SystemState) -> None:
-    global current_state, is_safe_starting, safe_start_timer
+    global current_state, is_safe_starting, safe_start_timer, force_control_run
 
     if new_state == current_state:
         return
@@ -177,12 +188,15 @@ def _enter_state(new_state: SystemState) -> None:
         safe_start_timer = 0.0
         controller.reset_integrator()
 
+    if new_state in ("SAFETY_CORRECTION", "PRE_START", "WORK_SHIFT"):
+        force_control_run = True
+
     current_state = new_state
 
 
 def _tick_safe_start() -> bool:
     """Возвращает True, если безопасный пуск ещё активен (контроллер отключён)."""
-    global safe_start_timer, is_safe_starting
+    global safe_start_timer, is_safe_starting, force_control_run
 
     if not is_safe_starting:
         return False
@@ -190,6 +204,7 @@ def _tick_safe_start() -> bool:
     safe_start_timer += SIMULATION_INTERVAL_SEC
     if safe_start_timer >= SAFE_START_DURATION_SEC:
         is_safe_starting = False
+        force_control_run = True
         return False
     return True
 
@@ -205,22 +220,27 @@ def _apply_safe_start_outputs() -> None:
 
 def _apply_controller(target_temp: float, current_time: float) -> None:
     global heater_pwr, cooler_pwr, airflow_pwr, dampers_open, prev_inflow_setpoint
+    global last_control_timestamp
+
+    dt_elapsed = current_time - last_control_timestamp
+    dt_elapsed = max(2.0, min(120.0, dt_elapsed))
 
     output = controller.calculate(
         target_temp,
-        simulator.inside_temp,
+        sensor_inside_temp,
         outside_temp,
-        simulator.inflow_temp,
+        sensor_inflow_temp,
         current_time,
         heater_pwr,
         cooler_pwr,
-        dt=SIMULATION_INTERVAL_SEC,
+        dt=dt_elapsed,
     )
     heater_pwr = output["heater_power"]
     cooler_pwr = output["cooler_power"]
     airflow_pwr = output["airflow_power"]
     prev_inflow_setpoint = output["inflow_setpoint"]
     dampers_open = True
+    last_control_timestamp = current_time
 
 
 def _process_purge() -> None:
@@ -232,23 +252,12 @@ def _process_purge() -> None:
     airflow_pwr = 30.0
     purge_timer += SIMULATION_INTERVAL_SEC
 
-    heating_purge = prev_inflow_setpoint >= outside_temp
-    purge_complete = False
+    heater_safe = sensor_heater_temp < T_heater_safe
+    cooler_safe = sensor_cooler_temp > T_cooler_safe
+    max_allowed_purge_time = max(t_purge_max_heat, t_purge_max_cool)
+    timeout_reached = purge_timer >= max_allowed_purge_time
 
-    if heating_purge:
-        purge_complete = (
-            simulator.heater_temp < T_heater_safe
-            or abs(simulator.heater_temp - outside_temp) < T_purge_diff
-            or purge_timer >= t_purge_max_heat
-        )
-    else:
-        purge_complete = (
-            simulator.cooler_temp > T_cooler_safe
-            or abs(simulator.cooler_temp - outside_temp) < T_purge_diff
-            or purge_timer >= t_purge_max_cool
-        )
-
-    if purge_complete:
+    if (heater_safe and cooler_safe) or timeout_reached:
         heater_pwr = 0.0
         cooler_pwr = 0.0
         airflow_pwr = 0.0
@@ -256,23 +265,11 @@ def _process_purge() -> None:
         _enter_state("STANDBY")
 
 
-def _run_standby_logic(db: Session, now_min: int) -> None:
-    global current_target_temp, pre_start_temp_start, pre_start_timer
-    global safety_target_temp, safety_heating
-    global heater_pwr, cooler_pwr, airflow_pwr, dampers_open
+def _run_standby_fast_safety() -> None:
+    """Быстрый цикл (2 с): мгновенная проверка пределов ТБ по зашумлённому датчику."""
+    global safety_target_temp, safety_heating, current_target_temp
 
-    active_shift = _get_active_shift(db, now_min)
-    if active_shift is not None:
-        current_target_temp = active_shift.target_temp
-        _enter_state("WORK_SHIFT")
-        return
-
-    heater_pwr = 0.0
-    cooler_pwr = 0.0
-    airflow_pwr = 0.0
-    dampers_open = False
-
-    inside = simulator.inside_temp
+    inside = sensor_inside_temp
 
     if inside < T_safe_min:
         safety_target_temp = T_safe_min + T_safe_hyst
@@ -286,7 +283,26 @@ def _run_standby_logic(db: Session, now_min: int) -> None:
         safety_heating = False
         current_target_temp = safety_target_temp
         _enter_state("SAFETY_CORRECTION")
+
+
+def _run_standby_logic(db: Session, now_min: int) -> None:
+    """Медленный цикл (60 с): планировщик смен и энергосбережение."""
+    global current_target_temp, pre_start_temp_start, pre_start_timer
+    global pre_start_start_timestamp
+    global heater_pwr, cooler_pwr, airflow_pwr, dampers_open
+
+    active_shift = _get_active_shift(db, now_min)
+    if active_shift is not None:
+        current_target_temp = active_shift.target_temp
+        _enter_state("WORK_SHIFT")
         return
+
+    heater_pwr = 0.0
+    cooler_pwr = 0.0
+    airflow_pwr = 0.0
+    dampers_open = False
+
+    inside = sensor_inside_temp
 
     upcoming = _get_nearest_upcoming_shift(db, now_min)
     if upcoming is not None:
@@ -297,6 +313,7 @@ def _run_standby_logic(db: Session, now_min: int) -> None:
         if minutes_until <= t_pre_start:
             pre_start_temp_start = inside
             pre_start_timer = 0.0
+            pre_start_start_timestamp = time.time()
             current_target_temp = shift.target_temp
             _enter_state("PRE_START")
     else:
@@ -304,15 +321,14 @@ def _run_standby_logic(db: Session, now_min: int) -> None:
 
 
 def _run_safety_correction_logic(current_time: float) -> None:
-    global current_target_temp, purge_timer
+    global purge_timer
 
-    if _tick_safe_start():
-        _apply_safe_start_outputs()
+    if is_safe_starting:
         return
 
     _apply_controller(safety_target_temp, current_time)
 
-    inside = simulator.inside_temp
+    inside = sensor_inside_temp
     corrected = (
         safety_heating and inside >= safety_target_temp
     ) or (
@@ -325,26 +341,30 @@ def _run_safety_correction_logic(current_time: float) -> None:
 
 
 def _run_pre_start_logic(db: Session, now_min: int, current_time: float) -> None:
-    global pre_start_timer, v_smooth, current_target_temp
+    global pre_start_timer, v_smooth, current_target_temp, purge_timer
 
     upcoming = _get_nearest_upcoming_shift(db, now_min)
     if upcoming is not None:
         shift, _ = upcoming
         current_target_temp = shift.target_temp
-
-    if _tick_safe_start():
-        _apply_safe_start_outputs()
     else:
-        _apply_controller(current_target_temp, current_time)
+        purge_timer = 0.0
+        _enter_state("PURGING")
+        return
 
-    pre_start_timer += SIMULATION_INTERVAL_SEC
+    if is_safe_starting:
+        return
+
+    pre_start_timer = time.time() - pre_start_start_timestamp
+
+    _apply_controller(current_target_temp, current_time)
 
     active_shift = _get_active_shift(db, now_min)
     if active_shift is not None:
         delta_t_fact = pre_start_timer / 60.0
         delta_temp = abs(active_shift.target_temp - pre_start_temp_start)
         v_climate = delta_temp / max(1.0, delta_t_fact)
-        v_smooth = alpha * v_climate + (1.0 - alpha) * v_smooth
+        v_smooth = max(0.01, alpha * v_climate + (1.0 - alpha) * v_smooth)
         current_target_temp = active_shift.target_temp
         _enter_state("WORK_SHIFT")
 
@@ -360,10 +380,10 @@ def _run_work_shift_logic(db: Session, now_min: int, current_time: float) -> Non
 
     current_target_temp = active_shift.target_temp
 
-    if _tick_safe_start():
-        _apply_safe_start_outputs()
-    else:
-        _apply_controller(current_target_temp, current_time)
+    if is_safe_starting:
+        return
+
+    _apply_controller(current_target_temp, current_time)
 
 
 def _run_automatic_control(db: Session) -> None:
@@ -378,42 +398,71 @@ def _run_automatic_control(db: Session) -> None:
         _run_pre_start_logic(db, now_min, current_time)
     elif current_state == "WORK_SHIFT":
         _run_work_shift_logic(db, now_min, current_time)
-    elif current_state == "PURGING":
-        _process_purge()
 
 
 async def simulation_loop() -> None:
     global outside_temp, heater_pwr, cooler_pwr, airflow_pwr, dampers_open
+    global sensor_inside_temp, sensor_inflow_temp, sensor_heater_temp, sensor_cooler_temp
+    global control_timer, force_control_run
 
     while True:
         outside_temp = 5.0 + 5.0 * math.sin(time.time() / 3600.0)
 
         db = SessionLocal()
         try:
+            now_min = _now_minutes()
+            shift_active = _get_active_shift(db, now_min) is not None
+
+            if not is_manual_mode:
+                if current_state == "PURGING":
+                    _process_purge()
+                elif current_state == "STANDBY":
+                    _run_standby_fast_safety()
+                elif current_state in ("SAFETY_CORRECTION", "PRE_START", "WORK_SHIFT"):
+                    if is_safe_starting:
+                        _tick_safe_start()
+                        if is_safe_starting:
+                            _apply_safe_start_outputs()
+
             if is_manual_mode:
                 heater_pwr = manual_heater
                 cooler_pwr = manual_cooler
                 airflow_pwr = manual_airflow
                 dampers_open = manual_airflow > 0.0
-            else:
-                _run_automatic_control(db)
+            elif current_state in (
+                "STANDBY",
+                "SAFETY_CORRECTION",
+                "PRE_START",
+                "WORK_SHIFT",
+            ):
+                control_timer += SIMULATION_INTERVAL_SEC
+                if control_timer >= CONTROL_INTERVAL_SEC or force_control_run:
+                    _run_automatic_control(db)
+                    control_timer = 0.0
+                    force_control_run = False
 
-            simulator.update_physics(
+            (
+                sensor_inside_temp,
+                sensor_inflow_temp,
+                sensor_heater_temp,
+                sensor_cooler_temp,
+            ) = simulator.update_physics(
                 heater_pwr,
                 cooler_pwr,
                 airflow_pwr,
                 dampers_open,
                 outside_temp,
+                shift_active,
                 dt=SIMULATION_INTERVAL_SEC,
             )
 
             db.add(
                 TelemetryLog(
-                    inside_temp=simulator.inside_temp,
+                    inside_temp=sensor_inside_temp,
                     outside_temp=outside_temp,
-                    inflow_temp=simulator.inflow_temp,
-                    heater_temp=simulator.heater_temp,
-                    cooler_temp=simulator.cooler_temp,
+                    inflow_temp=sensor_inflow_temp,
+                    heater_temp=sensor_heater_temp,
+                    cooler_temp=sensor_cooler_temp,
                     target_temp=current_target_temp,
                     heater_power=heater_pwr,
                     cooler_power=cooler_pwr,
@@ -458,11 +507,11 @@ app.add_middleware(
 
 def _current_status() -> SystemStatus:
     return SystemStatus(
-        inside_temp=simulator.inside_temp,
+        inside_temp=sensor_inside_temp,
         outside_temp=outside_temp,
-        inflow_temp=simulator.inflow_temp,
-        heater_temp=simulator.heater_temp,
-        cooler_temp=simulator.cooler_temp,
+        inflow_temp=sensor_inflow_temp,
+        heater_temp=sensor_heater_temp,
+        cooler_temp=sensor_cooler_temp,
         target_temp=current_target_temp,
         heater_power=heater_pwr,
         cooler_power=cooler_pwr,
@@ -475,12 +524,12 @@ def _current_status() -> SystemStatus:
 
 
 @app.get("/api/status", response_model=SystemStatus)
-def get_status() -> SystemStatus:
+async def get_status() -> SystemStatus:
     return _current_status()
 
 
 @app.get("/api/history", response_model=list[TelemetryLogRead])
-def get_history(db: Session = Depends(get_db)) -> list[TelemetryLogRead]:
+async def get_history(db: Session = Depends(get_db)) -> list[TelemetryLogRead]:
     logs = db.scalars(
         select(TelemetryLog)
         .order_by(desc(TelemetryLog.timestamp))
@@ -490,7 +539,7 @@ def get_history(db: Session = Depends(get_db)) -> list[TelemetryLogRead]:
 
 
 @app.post("/api/manual", response_model=SystemStatus)
-def set_manual_mode(body: ManualControlRequest) -> SystemStatus:
+async def set_manual_mode(body: ManualControlRequest) -> SystemStatus:
     global is_manual_mode, manual_heater, manual_cooler, manual_airflow
 
     is_manual_mode = True
@@ -501,24 +550,24 @@ def set_manual_mode(body: ManualControlRequest) -> SystemStatus:
 
 
 @app.post("/api/auto", response_model=SystemStatus)
-def set_auto_mode() -> SystemStatus:
+async def set_auto_mode() -> SystemStatus:
     global is_manual_mode, purge_timer
 
     is_manual_mode = False
-    if simulator.heater_temp >= T_heater_safe or simulator.cooler_temp <= T_cooler_safe:
+    if sensor_heater_temp >= T_heater_safe or sensor_cooler_temp <= T_cooler_safe:
         purge_timer = 0.0
         _enter_state("PURGING")
     return _current_status()
 
 
 @app.get("/api/shifts", response_model=list[WorkShiftRead])
-def list_shifts(db: Session = Depends(get_db)) -> list[WorkShiftRead]:
+async def list_shifts(db: Session = Depends(get_db)) -> list[WorkShiftRead]:
     shifts = db.scalars(select(WorkShift).order_by(WorkShift.start_time)).all()
     return [WorkShiftRead.model_validate(shift) for shift in shifts]
 
 
 @app.get("/api/shifts/{shift_id}", response_model=WorkShiftRead)
-def get_shift(shift_id: int, db: Session = Depends(get_db)) -> WorkShiftRead:
+async def get_shift(shift_id: int, db: Session = Depends(get_db)) -> WorkShiftRead:
     shift = db.get(WorkShift, shift_id)
     if shift is None:
         raise HTTPException(status_code=404, detail="Work shift not found")
@@ -526,7 +575,7 @@ def get_shift(shift_id: int, db: Session = Depends(get_db)) -> WorkShiftRead:
 
 
 @app.post("/api/shifts", response_model=WorkShiftRead, status_code=201)
-def create_shift(
+async def create_shift(
     body: WorkShiftCreate, db: Session = Depends(get_db)
 ) -> WorkShiftRead:
     shift = WorkShift(**body.model_dump())
@@ -537,7 +586,7 @@ def create_shift(
 
 
 @app.put("/api/shifts/{shift_id}", response_model=WorkShiftRead)
-def update_shift(
+async def update_shift(
     shift_id: int, body: WorkShiftCreate, db: Session = Depends(get_db)
 ) -> WorkShiftRead:
     shift = db.get(WorkShift, shift_id)
@@ -553,7 +602,7 @@ def update_shift(
 
 
 @app.delete("/api/shifts/{shift_id}", status_code=204)
-def delete_shift(shift_id: int, db: Session = Depends(get_db)) -> None:
+async def delete_shift(shift_id: int, db: Session = Depends(get_db)) -> None:
     shift = db.get(WorkShift, shift_id)
     if shift is None:
         raise HTTPException(status_code=404, detail="Work shift not found")

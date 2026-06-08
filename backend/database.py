@@ -1,14 +1,16 @@
 from collections.abc import Generator
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, create_engine
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///./climate.db"
+TZ_MINSK = ZoneInfo("Europe/Minsk")
 
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
-    connect_args={"check_same_thread": False},
+    connect_args={"check_same_thread": False, "timeout": 30.0},
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -17,8 +19,8 @@ class Base(DeclarativeBase):
     pass
 
 
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+def _minsk_now() -> datetime:
+    return datetime.now(TZ_MINSK)
 
 
 class TelemetryLog(Base):
@@ -26,8 +28,8 @@ class TelemetryLog(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     timestamp: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=_utc_now,
+        DateTime,
+        default=_minsk_now,
     )
     inside_temp: Mapped[float] = mapped_column(Float)
     outside_temp: Mapped[float] = mapped_column(Float)
@@ -55,6 +57,9 @@ class WorkShift(Base):
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    with engine.connect() as conn:
+        conn.execute(text("PRAGMA journal_mode=WAL;"))
+        conn.commit()
 
 
 def get_db() -> Generator[Session, None, None]:
