@@ -2,6 +2,10 @@ FROM python:3-slim
 
 WORKDIR /app
 
+# Отключаем генерацию pyc-файлов и буферизацию логов для контейнера
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

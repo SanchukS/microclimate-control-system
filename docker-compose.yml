@@ -6,6 +6,7 @@ services:
       - "8000:8000"
     volumes:
       - ./backend/climate.db:/app/climate.db
+    restart: unless-stopped
 
   frontend:
     build:
@@ -14,3 +15,4 @@ services:
       - "3000:80"
     depends_on:
       - backend
+    restart: unless-stopped
