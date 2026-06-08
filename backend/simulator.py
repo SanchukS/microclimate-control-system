@@ -13,7 +13,7 @@ def _sign(value: float) -> float:
 class ClimateSimulator:
     C_AIR = 1005.0
     G_MAX = 1.5
-    C_ROOM_EFF = 5.0e7
+    C_ROOM_EFF = 5.0e5
     C_HEATER = 25000.0
     C_COOLER = 30000.0
     P_H_MAX = 40000.0
@@ -227,6 +227,16 @@ class CascadedClimateController:
             airflow_power = self.f_min
         else:
             airflow_power = min(100.0, self.f_min + self.k_fan * t_fan_active)
+
+        delta_t_inflow = abs(current_inflow_temp - t_inflow_setpoint)
+        target_airflow = airflow_power
+        if delta_t_inflow > 5.0:
+            target_airflow = self.f_min
+
+        airflow_power = max(
+            self.last_airflow_power - 10.0,
+            min(target_airflow, self.last_airflow_power + 10.0),
+        )
 
         e_inflow = t_inflow_setpoint - current_inflow_temp
         required_mode = (
